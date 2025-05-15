@@ -1,0 +1,545 @@
+import argparse
+import copy
+import json
+import os
+import random
+from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor
+
+# import backoff
+import numpy as np
+import openai
+import pandas
+from tqdm import tqdm
+
+from mmlu_prompt import get_init_archive, get_prompt, get_reflexion_prompt
+
+client = openai.OpenAI()
+
+from utils import format_multichoice_question, random_id, bootstrap_confidence_interval
+
+### adding new imports (batu)
+from _lm_calls import get_json_response_from_gpt, get_json_response_from_gpt_reflect  # needed for cost tracking
+from _tracker_context import _CURRENT_TRACKER 
+from _cost_tracker import CostTracker
+###
+
+# Edits (batu):
+# - added cost tracking 
+# - moved lm calls to _lm_calls.py
+# - keeping the LM base here becuase it is different for each dataset
+
+Info = namedtuple('Info', ['name', 'author', 'content', 'iteration_idx'])
+
+FORMAT_INST = lambda request_keys: f"""Reply EXACTLY with the following JSON format.\n{str(request_keys)}\nDO NOT MISS ANY REQUEST FIELDS and ensure that your response is a well-formed JSON object!\n"""
+ROLE_DESC = lambda role: f"You are a {role}."
+SYSTEM_MSG = ""
+
+PRINT_LLM_DEBUG = False
+SEARCHING_MODE = True
+
+
+class LLMAgentBase():
+    """
+    Attributes:
+    """
+
+    def __init__(self, output_fields: list, agent_name: str,
+                 role='helpful assistant', model='gpt-3.5-turbo-0125', temperature=0.5) -> None:
+        self.output_fields = output_fields
+        self.agent_name = agent_name
+
+        self.role = role
+        self.model = model
+        self.temperature = temperature
+
+        # give each instance a unique id
+        self.id = random_id()
+        self.cost_tracker = (_CURRENT_TRACKER.get()) # adding cost tracker (batu)
+
+    def generate_prompt(self, input_infos, instruction) -> str:
+        # construct system prompt
+        output_fields_and_description = {key: f"Your {key}." if not 'answer' in key else f"Your {key}. Return ONLY the alphabet choice, i.e. A or B or C or D." for key in self.output_fields}
+        system_prompt = ROLE_DESC(self.role) + "\n\n" + FORMAT_INST(output_fields_and_description)
+
+        # construct input infos text
+        input_infos_text = ''
+        for input_info in input_infos:
+            if isinstance(input_info, Info):
+                (field_name, author, content, iteration_idx) = input_info
+            else:
+                continue
+            if author == self.__repr__():
+                author += ' (yourself)'
+            if field_name == 'task':
+                input_infos_text += f'# Your Task:\n{content}\n\n'
+            elif iteration_idx != -1:
+                input_infos_text += f'### {field_name} #{iteration_idx + 1} by {author}:\n{content}\n\n'
+            else:
+                input_infos_text += f'### {field_name} by {author}:\n{content}\n\n'
+
+        prompt = input_infos_text + instruction
+        return system_prompt, prompt
+
+    def query(self, input_infos: list, instruction, iteration_idx=-1) -> dict:
+        system_prompt, prompt = self.generate_prompt(input_infos, instruction)
+        try:
+            response_json = {}
+
+            ### BEGIN - ADDED ### (batu)
+            response_json, cost = get_json_response_from_gpt(prompt, self.model, system_prompt, self.temperature)
+            if self.cost_tracker is not None:
+                self.cost_tracker.add(cost)
+            else:
+                print("self.cost_tracker is None, cannot track costs")
+            ### END - ADDED ###
+
+            assert len(response_json) == len(self.output_fields), "not returning enough fields"
+        except Exception as e:
+            # print(e)
+            if "maximum context length" in str(e) and SEARCHING_MODE:
+                raise AssertionError("The context is too long. Please try to design the agent to have shorter context.")
+            # try to fill in the missing field
+            for key in self.output_fields:
+                if not key in response_json and len(response_json) < len(self.output_fields):
+                    response_json[key] = ''
+            for key in copy.deepcopy(list(response_json.keys())):
+                if len(response_json) > len(self.output_fields) and not key in self.output_fields:
+                    del response_json[key]
+        output_infos = []
+        for key, value in response_json.items():
+            info = Info(key, self.__repr__(), value, iteration_idx)
+            output_infos.append(info)
+        return output_infos
+
+    def __repr__(self):
+        return f"{self.agent_name} {self.id}"
+
+    def __call__(self, input_infos: list, instruction, iteration_idx=-1):
+        return self.query(input_infos, instruction, iteration_idx=iteration_idx)
+
+
+class AgentSystem():
+    def __init__(self) -> None:
+        self.cost_tracker = CostTracker() # adding cost tracker (batu)
+        pass
+
+
+def search(args):
+    file_path = os.path.join(args.save_dir, f"{args.expr_name}_run_archive.json")
+    if os.path.exists(file_path):
+        with open(file_path, 'r') as json_file:
+            archive = json.load(json_file)
+        if "generation" in archive[-1] and isinstance(archive[-1]['generation'], int):
+            start = archive[-1]['generation']
+        else:
+            start = 0
+    else:
+        archive = get_init_archive()
+        start = 0
+
+    for solution in archive:
+        if 'fitness' in solution:
+            continue
+
+        solution['generation'] = "initial"
+        print(f"============Initial Archive: {solution['name']}=================")
+        try:
+            acc_list, cost_list = evaluate_forward_fn(args, solution["code"])
+        except Exception as e:
+            print("During evaluating initial archive:")
+            print(e)
+            continue
+
+        fitness_str = bootstrap_confidence_interval(acc_list)
+        solution['fitness'] = fitness_str
+        solution['acc_list'] = acc_list # (batu)
+        solution['cost_list'] = cost_list # (batu)
+
+        # save results
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        with open(file_path, 'w') as json_file:
+            json.dump(archive, json_file, indent=4)
+
+    for n in range(start, args.n_generation):
+        print(f"============Generation {n + 1}=================")
+        ### BEGIN - ADDED ### (batu)
+        generation_costs = {"generation": n + 1, "sampling": 0 , "reflection": 0 , "debugging": 0} 
+        clean_archive_keys = ["thought", "name", "code", "generation", "fitness"]
+        clean_archive = [{key: value for key, value in agent.items() if key in clean_archive_keys} for agent in archive]
+        system_prompt, prompt = get_prompt(clean_archive)
+        ### END - ADDED ###
+        msg_list = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            next_solution, sampling_cost = get_json_response_from_gpt_reflect(msg_list, args.model)
+            generation_costs["sampling"] += sampling_cost
+            Reflexion_prompt_1, Reflexion_prompt_2 = get_reflexion_prompt(clean_archive[-1] if n > 0 else None) # archive -> clean archive
+            # Reflexion 1
+            msg_list.append({"role": "assistant", "content": str(next_solution)})
+            msg_list.append({"role": "user", "content": Reflexion_prompt_1})
+            next_solution, reflection_cost1 = get_json_response_from_gpt_reflect(msg_list, args.model)
+            generation_costs["reflection"] += reflection_cost1
+            # Reflexion 2
+            msg_list.append({"role": "assistant", "content": str(next_solution)})
+            msg_list.append({"role": "user", "content": Reflexion_prompt_2})
+            next_solution, reflection_cost2 = get_json_response_from_gpt_reflect(msg_list, args.model)
+            generation_costs["reflection"] += reflection_cost2
+        except Exception as e:
+            print("During LLM generate new solution:")
+            print(e)
+            n -= 1
+            continue
+
+        acc_list = []
+        for _ in range(args.debug_max):
+            try:
+                acc_list, cost_list = evaluate_forward_fn(args, next_solution["code"])
+                if np.mean(acc_list) < 0.01 and SEARCHING_MODE:
+                    raise Exception("All 0 accuracy")
+                break
+            except Exception as e:
+                print("During evaluation:")
+                print(e)
+                msg_list.append({"role": "assistant", "content": str(next_solution)})
+                msg_list.append({"role": "user", "content": f"Error during evaluation:\n{e}\nCarefully consider where you went wrong in your latest implementation. Using insights from previous attempts, try to debug the current code to implement the same thought. Repeat your previous thought in 'thought', and put your thinking for debugging in 'debug_thought'"})
+                try:
+                    next_solution, debugging_cost = get_json_response_from_gpt_reflect(msg_list, args.model)
+                    generation_costs["debugging"] += debugging_cost
+                except Exception as e:
+                    print("During LLM generate new solution:")
+                    print(e)
+                    continue
+                continue
+        if not acc_list:
+            n -= 1
+            continue
+
+        fitness_str = bootstrap_confidence_interval(acc_list)
+        next_solution['fitness'] = fitness_str
+        next_solution['generation'] = n + 1
+        next_solution['acc_list'] = acc_list # (batu)
+        next_solution['cost_list'] = cost_list # (batu)
+
+
+        if 'debug_thought' in next_solution:
+            del next_solution['debug_thought']
+        if 'reflection' in next_solution:
+            del next_solution['reflection']
+        archive.append(next_solution)
+
+        # save results
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        with open(file_path, 'w') as json_file:
+            json.dump(archive, json_file, indent=4)
+        # save generation costs (batu)
+        cost_file_path = os.path.join(args.save_dir, f"{args.expr_name}_generation_costs.jsonl")
+        os.makedirs(os.path.dirname(cost_file_path), exist_ok=True)
+        with open(cost_file_path, 'a') as jsonl_file:
+            jsonl_file.write(json.dumps(generation_costs) + '\n')
+
+# batu: adding the agent selection
+def agent_selection(args):
+    file_path = os.path.join(args.save_dir, f"{args.expr_name}_run_archive.json")
+    with open(file_path, 'r') as json_file:
+        archive = json.load(json_file)
+    
+    # get the best agent
+    initial_archive = [agent for agent in archive if agent['generation'] == "initial"]
+    designed_archive = [agent for agent in archive if agent['generation'] != "initial"]
+    best_initial_agent = max(initial_archive, key=lambda x: np.mean(x['acc_list'])) # batu: using the mean of the acc_list
+    best_designed_agent = max(designed_archive, key=lambda x: np.mean(x['acc_list'])) # batu: using the mean of the acc_list
+    best_agents = [best_initial_agent, best_designed_agent]
+
+    # save the best agent
+    best_file_path = str(os.path.join(args.save_dir, f"{args.expr_name}_run_archive.json")).strip(".json") + "_selected_agents.json"
+    os.makedirs(os.path.dirname(best_file_path), exist_ok=True)
+    with open(best_file_path, 'w') as json_file:
+        json.dump(best_agents, json_file, indent=4)
+
+def evaluate(args):
+    file_path = os.path.join(args.save_dir, f"{args.expr_name}_run_archive_selected_agents.json") # batu: this is the file that contains the best agents
+    eval_file_path = str(os.path.join(args.save_dir, f"{args.expr_name}_run_archive_selected_agents.json")).strip(".json") + "_evaluate.json" # edited to be the same as the file that contains the best agents
+    with open(file_path, 'r') as json_file:
+        archive = json.load(json_file)
+    eval_archive = []
+    if os.path.exists(eval_file_path):
+        with open(eval_file_path, 'r') as json_file:
+            eval_archive = json.load(json_file)
+
+    current_idx = 0
+    while (current_idx < len(archive)):
+        with open(file_path, 'r') as json_file:
+            archive = json.load(json_file)
+        if current_idx < len(eval_archive):
+            current_idx += 1
+            continue
+        sol = archive[current_idx]
+        print(f"current_gen: {sol['generation']}, current_idx: {current_idx}")
+        current_idx += 1
+        try:
+            acc_list, cost_list = evaluate_forward_fn(args, sol["code"])
+        except Exception as e:
+            print(e)
+            continue
+        fitness_str = bootstrap_confidence_interval(acc_list)
+        sol['test_fitness'] = fitness_str
+        sol['test_acc_list'] = acc_list # batu
+        sol['test_cost_list'] = cost_list # batu
+        eval_archive.append(sol)
+
+        # save results
+        os.makedirs(os.path.dirname(eval_file_path), exist_ok=True)
+        with open(eval_file_path, 'w') as json_file:
+            json.dump(eval_archive, json_file, indent=4)
+
+
+def evaluate_forward_fn(forward_str, test_example):
+    # dynamically define forward()
+    # modified from https://github.com/luchris429/DiscoPOP/blob/main/scripts/launch_evo.py
+    namespace = {}
+    exec(forward_str, globals(), namespace)
+    names = list(namespace.keys())
+    if len(names) != 1:
+        raise AssertionError(f"{len(names)} things in namespace. Please only provide 1")
+    func = namespace[names[0]]
+    if not callable(func):
+        raise AssertionError(f"{func} is not callable")
+    setattr(AgentSystem, "forward", func)
+
+    LETTER_TO_INDEX = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
+    # set seed 0 for valid set
+    # df = pandas.read_csv(args.data_filename)
+    # random.seed(args.shuffle_seed)
+    # examples = [row.to_dict() for _, row in df.iterrows()]
+    # random.shuffle(examples)
+
+    # if SEARCHING_MODE:
+    #     examples = examples[:args.valid_size] * args.n_repreat
+    # else:
+    #     examples = examples[args.valid_size:args.valid_size + args.test_size] * args.n_repreat
+    examples = [test_example]
+
+    questions = [format_multichoice_question(example) for example in examples]
+    answers = [LETTER_TO_INDEX[example['Answer']] for example in examples]
+
+    # print(f"problem length: {len(examples)}")
+    max_workers = min(len(examples), args.max_workers) if args.multiprocessing else 1
+
+    task_queue = []
+    for q in questions:
+        taskInfo = Info('task', 'User', q, -1)
+        task_queue.append(taskInfo)
+
+    # agentSystem = AgentSystem()
+
+    ### BEGIN - ADDED ### (batu)
+    def process_task(task):
+        try:
+            task_agent = AgentSystem()
+            with task_agent.cost_tracker.activate():
+                result = task_agent.forward(task)
+            cost = task_agent.cost_tracker.total_cost
+            return result, cost
+        except Exception as e:
+            # print(e)
+            return 0, None
+    
+    # with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    #     combined_results = list(tqdm(executor.map(process_task, task_queue), total=len(task_queue))) 
+    combined_results = [process_task(task) for task in task_queue]
+    results = [item[0] for item in combined_results]
+    cost_list = [item[1] for item in combined_results]
+    ### END - ADDED ###
+
+    acc_list = []
+    # with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    #     results = list(tqdm(executor.map(agentSystem.forward, task_queue), total=len(task_queue)))
+
+    for q_idx, res in enumerate(results):
+        try:
+            if isinstance(res, str) and res in LETTER_TO_INDEX:
+                predicted_idx = LETTER_TO_INDEX[res]
+            elif 'A)' in res:
+                predicted_idx = 0
+            elif 'B)' in res:
+                predicted_idx = 1
+            elif 'C)' in res:
+                predicted_idx = 2
+            elif 'D)' in res:
+                predicted_idx = 3
+            elif isinstance(res, list):
+                try_res = res[1]
+                predicted_idx = LETTER_TO_INDEX[try_res.content]
+            elif res.content in LETTER_TO_INDEX:
+                predicted_idx = LETTER_TO_INDEX[res.content]
+            elif 'A)' in res.content:
+                predicted_idx = 0
+            elif 'B)' in res.content:
+                predicted_idx = 1
+            elif 'C)' in res.content:
+                predicted_idx = 2
+            elif 'D)' in res.content:
+                predicted_idx = 3
+            else:
+                print(f"error in q {q_idx}")
+                acc_list.append(0)
+                continue
+        except Exception as e:
+            acc_list.append(0)
+            continue
+
+        if predicted_idx == answers[q_idx]:
+            acc_list.append(1)
+        else:
+            acc_list.append(0)
+    # print(f"acc: {bootstrap_confidence_interval(acc_list)}")
+
+    # Test Cost Tracking (batu)
+    # print(f"cost_list: {cost_list}")
+    # print(f"acc_list: {acc_list}")
+    return acc_list[0], cost_list[0]
+
+def routing(args):
+    #########################################################
+    # load datasets
+    SEARCHING_MODE = True
+    df = pandas.read_csv(args.data_filename)
+    random.seed(args.shuffle_seed)
+    examples = [row.to_dict() for _, row in df.iterrows()]
+    random.shuffle(examples)
+    train_examples = examples[:args.valid_size] * args.n_repreat
+    train_questions = [format_multichoice_question(example) for example in train_examples]
+    train_example_embeddings = client.embeddings.create(model="text-embedding-3-small",input=train_questions)
+    train_example_embeddings_array = np.array([embedding.embedding for embedding in train_example_embeddings.data])
+    # print(train_example_embeddings_array.shape)
+    SEARCHING_MODE = False
+    df = pandas.read_csv(args.data_filename)
+    random.seed(args.shuffle_seed)
+    examples = [row.to_dict() for _, row in df.iterrows()]
+    random.shuffle(examples)
+    test_examples = examples[args.valid_size:args.valid_size + args.test_size] * args.n_repreat
+    test_questions = [format_multichoice_question(example) for example in test_examples]
+    test_example_embeddings = client.embeddings.create(model="text-embedding-3-small",input=test_questions)
+    test_example_embeddings_array = np.array([embedding.embedding for embedding in test_example_embeddings.data])
+    # print(test_example_embeddings_array.shape)
+    #########################################################
+
+    #########################################################
+    # compute the cosine similarity between the embeddings of the training and the test examples
+    cosine_similarities = np.dot(test_example_embeddings_array, train_example_embeddings_array.T) # the embeddings are normalized
+    # use softmax to obtain a probability distribution over training examples for each test example
+    softmax_probabilities = np.exp(cosine_similarities) / np.sum(np.exp(cosine_similarities), axis=1, keepdims=True)
+    # print(softmax_probabilities)
+    # print(np.sum(softmax_probabilities, axis=1))
+    assert np.allclose(np.sum(softmax_probabilities, axis=1), 1.0), "The probabilities do not sum to 1"
+    # agent selection per question
+    file_path = os.path.join(args.save_dir, f"{args.expr_name}_run_archive.json")
+    with open(file_path, 'r') as json_file:
+        archive = json.load(json_file)
+    initial_archive = [agent for agent in archive if agent['generation'] == "initial"]
+    designed_archive = [agent for agent in archive if agent['generation'] != "initial"]
+    designed_agent_accuracies = [agent['acc_list'] for agent in designed_archive]
+    designed_agent_accuracies = np.array(designed_agent_accuracies)
+    #########################################################
+    ### Begin - Nearest Neighbor ###
+    # 0. Ranking by total accuracy
+    row_sums        = designed_agent_accuracies.sum(axis=1)
+    row_sums_order  = np.argsort(-row_sums, kind='mergesort')     # descending, stable
+    acc_sorted      = designed_agent_accuracies[row_sums_order]   # (A, Q_train)
+
+    # 1. For each test query pick its nearest neighbour in the archive
+    most_sim_q      = cosine_similarities.argmax(axis=1)          # (Q_test,)
+
+    # 2. Look at agents’ scores on that archive question (still sorted by totals)
+    per_query_acc   = acc_sorted[:, most_sim_q].T                 # (Q_test, A)
+
+    # 3. Choose the agent with highest question-score; ties go to higher row-sum
+    best_rows       = per_query_acc.argmax(axis=1)                # (Q_test,)
+    selected_agents = row_sums_order[best_rows]                   # original ids
+
+    # 4. Get the Code for the selected agents
+    selected_agent_forward_strings = [designed_archive[i]['code'] for i in selected_agents]
+    ### End - Nearest Neighbor ###
+    #########################################################
+
+    #########################################################
+    # use the following for evaluation
+    # 1. selected_agent_forward_strings
+    # 2. test_examples
+    #########################################################
+
+    #########################################################
+    ### Evaluation ###
+    print(f"problem length: {len(test_examples)}")
+    max_workers = min(len(test_examples), args.max_workers) if args.multiprocessing else 1
+    assert len(selected_agent_forward_strings) == len(test_examples), "the number of selected agents and test examples must be the same"
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        combined_results = list(tqdm(executor.map(evaluate_forward_fn, 
+                                                  selected_agent_forward_strings,
+                                                  test_examples,
+                                                  ), total=len(selected_agent_forward_strings))) 
+    
+    acc_list = [item[0] for item in combined_results]
+    cost_list = [item[1] for item in combined_results]
+    # print(f"acc_list: {acc_list}")
+    print(np.mean([acc for acc in acc_list if acc is not None]))
+    # print(f"cost_list: {cost_list}")
+    #########################################################
+    ### Save Results ###
+    #########################################################
+    sol = {}
+    fitness_str = bootstrap_confidence_interval(acc_list)
+    sol['test_fitness'] = fitness_str
+    sol['test_acc_list'] = acc_list 
+    sol['test_cost_list'] = cost_list 
+    sol['selected_agents'] = selected_agents.tolist()
+    sol["cosine_similarities"] = cosine_similarities.tolist()
+    sol["softmax_probabilities"] = softmax_probabilities.tolist()
+    sol["designed_agent_accuracies"] = designed_agent_accuracies.tolist()
+    sol["most_sim_q"] = most_sim_q.tolist()
+    # save results
+    routing_file_path = os.path.join(args.save_dir, f"{args.expr_name}_run_archive.json") .strip(".json") + "_routing_nn_evaluate.json" 
+    os.makedirs(os.path.dirname(routing_file_path), exist_ok=True)
+    with open(routing_file_path, 'w') as json_file:
+        json.dump(sol, json_file, indent=4)
+    #########################################################
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_filename', type=str, default="dataset/mmlu.csv")
+    parser.add_argument('--valid_size', type=int, default=128)
+    parser.add_argument('--test_size', type=int, default=200)
+    parser.add_argument('--shuffle_seed', type=int, default=0)
+    parser.add_argument('--n_repreat', type=int, default=1)
+    parser.add_argument('--multiprocessing', action='store_true', default=True)
+    parser.add_argument('--max_workers', type=int, default=48)
+    parser.add_argument('--debug', action='store_true', default=True)
+    parser.add_argument('--save_dir', type=str, default='results/mmlu/cumulative/')
+    parser.add_argument('--expr_name', type=str, default="mmlu_gpt3.5_results")
+    parser.add_argument('--n_generation', type=int, default=30)
+    parser.add_argument('--debug_max', type=int, default=3)
+    parser.add_argument('--model',
+                        type=str,
+                        default='gpt-4o-2024-05-13',
+                        choices=['gpt-4-turbo-2024-04-09', 'gpt-3.5-turbo-0125', 'gpt-4o-2024-05-13'])
+
+    args = parser.parse_args()
+    # search
+    # SEARCHING_MODE = True
+    # search(args)
+
+    # evaluate
+    # SEARCHING_MODE = False
+    # evaluate(args)
+
+    ### batu: adding the agent selection and evaluation
+    SEARCHING_MODE = False
+    # routing(args) # for testing
+    for save_dir in ["results/mmlu/cumulative/", "results/mmlu/parallel/", "results/mmlu/topk/"]:
+        print(f"Evaluating {save_dir}")
+        args.save_dir = save_dir
+        routing(args)
