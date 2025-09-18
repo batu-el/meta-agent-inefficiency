@@ -89,6 +89,6 @@ Each subfolder contains dataset-level JSON summaries and per-example JSONL trace
 
 - Source for dataset implementations and basis for the agent implementation: [dataset/readme.md](https://github.com/batu-el/meta-agent-inefficiency/blob/main/dataset/readme.md)
 
-### License and Citation
+### Citation
 
-Follow the repository LICENSE if present. If you use this codebase, please cite the project or associated paper. When appropriate, also cite ADAS as the originating implementation reference: [ShengranHu/ADAS](https://github.com/ShengranHu/ADAS)
+If you use this codebase, please cite the project or associated paper. When appropriate, also cite ADAS as the originating implementation reference: [ShengranHu/ADAS](https://github.com/ShengranHu/ADAS)
