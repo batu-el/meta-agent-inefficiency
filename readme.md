@@ -1,6 +1,6 @@
-## Meta-Agent Inefficiency — Codebase Guide
+## Meta-Agent Inefficiency
 
-This repository evaluates routing and search strategies for LLM-based agents across multiple datasets, tracks compute/token costs, and reproduces the figures/tables via notebooks. The code is organized per-dataset with a common structure so once you learn one, you know them all.
+This repository evaluates search and routing strategies for LLM-based meta agents across multiple datasets, tracks compute/token costs.
 
 > Attribution: Dataset implementations and the basis for the agent implementation are adapted from ADAS (Automated Design of Agentic Systems). See: [ShengranHu/ADAS](https://github.com/ShengranHu/ADAS).
 
@@ -28,19 +28,14 @@ This repository evaluates routing and search strategies for LLM-based agents acr
 - Root assets: `Figure*.png` snapshots; `requirements.txt` dependencies
 
 ### Installation
-
-1) Python
-- Use Python 3.10+
-
-2) Environment
+Environment
 ```bash
 python -m venv .venv
 source .venv/bin/activate  # macOS/Linux
 pip install -U pip
 pip install -r requirements.txt
 ```
-
-3) Credentials (LLM providers)
+Credentials (LLM providers)
 - Configure provider credentials as expected by `/_*/_lm_calls.py`.
 ```bash
 export OPENAI_API_KEY=YOUR_KEY   # plus other provider keys if applicable
@@ -48,7 +43,7 @@ export OPENAI_API_KEY=YOUR_KEY   # plus other provider keys if applicable
 
 ### Running Experiments
 
-Use the provided scripts; outputs are stored under `/results`.
+Use the provided scripts (for 3 runs); outputs are stored under `/results`.
 ```bash
 # Baseline sequential/cumulative-style runs
 bash scripts/run1.sh
